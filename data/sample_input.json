@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-08-31T12:20:00",
+  "heart_rate": 104,
+  "spo2": 95,
+  "body_temperature": 37.2,
+  "ambient_temperature": 36.0,
+  "humidity": 75,
+  "activity_level": "walking",
+  "rppg_quality": 0.8,
+  "sensor_quality": 0.87
+}
