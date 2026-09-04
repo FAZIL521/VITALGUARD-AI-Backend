@@ -1,14 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Dict, Any, List
-from datetime import datetime
+from typing import Optional, List, Dict, Any
 
-from risk.risk_engine import calculate_risk
-from explanation.explanation import human_explanation
-from forecast.forecast import forecast_risk
-from whatif.whatif_engine import simulate
 from baseline.baseline import build_baseline
+from risk.risk_engine import calculate_risk
+from forecast.forecast import forecast_risk
+from whatif.what_if import simulate, standard_scenarios
+from explanation.explanation import human_explanation
 
 
 # ============================================================
@@ -29,10 +28,10 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-    "http://127.0.0.1:5500",
-    "http://localhost:5500",
-    "https://vitalguard-ui.onrender.com"
-],
+        "http://127.0.0.1:5500",
+        "http://localhost:5500",
+        "https://vitalguard-ui.onrender.com"
+    ],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -88,7 +87,7 @@ class VitalInput(BaseModel):
 
 class WhatIfRequest(BaseModel):
     data: VitalInput
-    changes: Dict[str, Any]
+    changes: Dict[str, Any] = {}
 
 
 # ============================================================
@@ -126,21 +125,17 @@ BASELINE = build_baseline(BASELINE_ROWS)
 
 
 # ============================================================
-# DEMO DATA
+# DEFAULT / DEMO SENSOR DATA
 # ============================================================
 
 LIVE_DATA = {
     "timestamp": "2026-09-04T15:00:00",
-
     "heart_rate": 104,
     "spo2": 95,
     "body_temperature": 37.2,
-
     "ambient_temperature": 36,
     "humidity": 75,
-
     "activity_level": "walking",
-
     "rppg_quality": 0.80,
     "sensor_quality": 0.87
 }
@@ -154,17 +149,21 @@ LATEST_SENSOR_DATA = LIVE_DATA.copy()
 
 
 # ============================================================
-# HEALTH CHECK
+# ROOT
 # ============================================================
 
 @app.get("/")
 def root():
     return {
-        "project": "VITALGUARD",
-        "status": "running",
+        "service": "VITALGUARD AI",
+        "status": "ready",
         "message": "VITALGUARD AI backend is working"
     }
 
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.get("/health")
 def health():
@@ -179,13 +178,10 @@ def health():
 
 @app.post("/api/sensor")
 def receive_sensor_data(data: VitalInput):
-    """
-    Receive live data from ESP32 / rPPG / sensor gateway.
-    The latest reading is stored in memory.
-    """
 
     global LATEST_SENSOR_DATA
 
+    # Store the newest sensor reading in memory
     LATEST_SENSOR_DATA = data.model_dump()
 
     return {
@@ -200,18 +196,28 @@ def receive_sensor_data(data: VitalInput):
 # ============================================================
 
 @app.get("/api/live")
-def get_live_data():
+def api_live():
 
+    # Always use the latest data received from /api/sensor
     current = LATEST_SENSOR_DATA.copy()
+
 
     # --------------------------------------------------------
     # Risk calculation
     # --------------------------------------------------------
 
-    risk_result = calculate_risk(
-        current,
-        BASELINE
-    )
+    try:
+        risk_result = calculate_risk(
+            current,
+            BASELINE
+        )
+    except TypeError:
+        risk_result = calculate_risk(
+            current,
+            BASELINE,
+            []
+        )
+
 
     # --------------------------------------------------------
     # Explanation
@@ -223,10 +229,15 @@ def get_live_data():
         )
     except Exception:
         explanation = (
-            "Risk is calculated from personal baseline, "
-            "vital deviations, environmental conditions "
-            "and signal quality."
+            "Risk is calculated using personal baseline, "
+            "vital deviations, environmental conditions, "
+            "activity and signal quality."
         )
+
+
+    # Add explanation without destroying the original result
+    risk_result["explanation"] = explanation
+
 
     # --------------------------------------------------------
     # Forecast
@@ -239,41 +250,54 @@ def get_live_data():
             []
         )
     except Exception:
+
+        score = risk_result.get(
+            "score",
+            risk_result.get("risk_score", 0)
+        )
+
         forecast_result = {
             "points": [
                 {
                     "minutes": 10,
-                    "risk": risk_result.get("score", 0)
+                    "risk": score
                 },
                 {
                     "minutes": 20,
-                    "risk": risk_result.get("score", 0)
+                    "risk": score
                 },
                 {
                     "minutes": 30,
-                    "risk": risk_result.get("score", 0)
+                    "risk": score
                 }
             ]
         }
 
+
     # --------------------------------------------------------
-    # Simple heat indicator
+    # Environmental heat indicator
     # --------------------------------------------------------
 
     temperature = current["ambient_temperature"]
     humidity = current["humidity"]
 
     heat_index = round(
-        temperature
-        + (humidity / 100) * 2.4,
+        temperature + (humidity / 100) * 2.4,
         1
     )
 
+
     # --------------------------------------------------------
-    # Determine source
+    # Determine whether data is demo data
     # --------------------------------------------------------
 
-    is_demo = current == LIVE_DATA
+    is_demo = (
+        current.get("timestamp") == LIVE_DATA["timestamp"]
+        and current.get("heart_rate") == LIVE_DATA["heart_rate"]
+        and current.get("ambient_temperature") == LIVE_DATA["ambient_temperature"]
+        and current.get("humidity") == LIVE_DATA["humidity"]
+    )
+
 
     if is_demo:
         data_source = "SIMULATED_DEMO"
@@ -282,14 +306,41 @@ def get_live_data():
         data_source = "EXTERNAL_SENSOR"
         esp32_connected = True
 
+
     # --------------------------------------------------------
-    # rPPG
+    # rPPG status
     # --------------------------------------------------------
 
-    rppg_available = current.get(
-        "rppg_quality",
-        0
-    ) > 0
+    rppg_available = (
+        current.get("rppg_quality", 0) > 0
+    )
+
+
+    # --------------------------------------------------------
+    # Confidence
+    # --------------------------------------------------------
+
+    signal_confidence = round(
+        (
+            current.get("rppg_quality", 0)
+            +
+            current.get("sensor_quality", 0)
+        ) / 2,
+        3
+    )
+
+
+    # --------------------------------------------------------
+    # Recommendations
+    # --------------------------------------------------------
+
+    recommendations = [
+        "Reduce physical activity",
+        "Move to a cooler environment",
+        "Drink water",
+        "Recheck vitals"
+    ]
+
 
     # --------------------------------------------------------
     # Final response
@@ -314,7 +365,7 @@ def get_live_data():
 
         "rppg": {
             "heart_rate": current["heart_rate"],
-            "quality": current["rppg_quality"],
+            "quality": current.get("rppg_quality", 0),
             "available": rppg_available
         },
 
@@ -333,14 +384,13 @@ def get_live_data():
 
         "risk": risk_result,
 
+        "confidence": {
+            "score": signal_confidence
+        },
+
         "forecast": forecast_result,
 
-        "recommendations": [
-            "Reduce physical activity",
-            "Move to a cooler environment",
-            "Drink water",
-            "Recheck vitals"
-        ],
+        "recommendations": recommendations,
 
         "data_source": data_source
     }
@@ -352,17 +402,28 @@ def get_live_data():
 
 @app.get("/live")
 def live_alias():
-    return get_live_data()
+    return api_live()
 
 
 @app.get("/status")
 def status_alias():
-    return get_live_data()
+    return api_live()
 
 
 @app.get("/api/status")
 def api_status_alias():
-    return get_live_data()
+    return api_live()
+
+
+# ============================================================
+# BASELINE ENDPOINT
+# ============================================================
+
+@app.get("/baseline")
+def get_baseline():
+    return {
+        "baseline": BASELINE
+    }
 
 
 # ============================================================
@@ -372,10 +433,24 @@ def api_status_alias():
 @app.post("/risk")
 def risk_endpoint(data: VitalInput):
 
-    result = calculate_risk(
-        data.model_dump(),
-        BASELINE
-    )
+    current = data.model_dump()
+
+    try:
+        result = calculate_risk(
+            current,
+            BASELINE
+        )
+    except TypeError:
+        result = calculate_risk(
+            current,
+            BASELINE,
+            []
+        )
+
+    try:
+        result["explanation"] = human_explanation(result)
+    except Exception:
+        pass
 
     return result
 
@@ -389,7 +464,8 @@ def confidence_endpoint(data: VitalInput):
 
     quality = (
         data.rppg_quality
-        + data.sensor_quality
+        +
+        data.sensor_quality
     ) / 2
 
     return {
@@ -407,21 +483,32 @@ def confidence_endpoint(data: VitalInput):
 @app.post("/forecast")
 def forecast_endpoint(data: VitalInput):
 
+    current = data.model_dump()
+
     try:
         return forecast_risk(
-            data.model_dump(),
+            current,
             BASELINE,
             []
         )
-    except Exception:
-        risk = calculate_risk(
-            data.model_dump(),
-            BASELINE
-        )
 
-        score = risk.get(
+    except Exception:
+
+        try:
+            risk_result = calculate_risk(
+                current,
+                BASELINE
+            )
+        except TypeError:
+            risk_result = calculate_risk(
+                current,
+                BASELINE,
+                []
+            )
+
+        score = risk_result.get(
             "score",
-            0
+            risk_result.get("risk_score", 0)
         )
 
         return {
@@ -486,29 +573,23 @@ def whatif_endpoint(
 
 @app.post("/what-if/standard")
 def standard_what_if(
-    req: WhatIfRequest
+    data: VitalInput
 ):
 
-    current = req.data.model_dump()
+    current = data.model_dump()
 
-    return simulate(
-        current,
-        BASELINE,
-        [],
-        req.changes
-    )
+    try:
+        return standard_scenarios(
+            current,
+            BASELINE,
+            []
+        )
 
+    except Exception:
 
-# ============================================================
-# BASELINE
-# ============================================================
-
-@app.get("/baseline")
-def get_baseline():
-
-    return {
-        "baseline": BASELINE
-    }
+        return {
+            "message": "Standard what-if scenarios unavailable"
+        }
 
 
 # ============================================================
@@ -529,7 +610,10 @@ def startup_event():
     print(" POST /api/sensor")
     print(" GET  /api/live")
     print(" POST /risk")
+    print(" POST /confidence")
     print(" POST /forecast")
     print(" POST /whatif")
+    print(" POST /what-if")
+    print(" GET  /baseline")
     print("=" * 60)
     print("")
